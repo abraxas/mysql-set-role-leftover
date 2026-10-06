@@ -16,6 +16,8 @@
 
 # mysql-set-role-leftover
 
+**Class:** Privilege leftover
+
 **MySQL Community Server** `mysqld` `26.7.0` (`06a5c1c`) - Oracle
 
 `SET ROLE ALL EXCEPT rfile` (or `SET ROLE DEFAULT` with no defaults) clears the active-role list, then `checkout_access_maps()` returns without `set_master_access(user->access)`. `CURRENT_ROLE()` is NONE. Static global bits that the role aggregated (FILE, PROCESS, SUPER, ...) stay in `m_master_access`. `check_access` reads that leftover. Lab: leftover FILE writes `INTO OUTFILE` as the mysqld UID.
@@ -25,6 +27,7 @@
 | | |
 |---|---|
 | ID | no CVE yet |
+| Class | **Privilege leftover** (FILE write as mysqld UID; not OS LPE) |
 | CWE | [CWE-269](https://cwe.mitre.org/data/definitions/269.html) |
 | CVSS | **High: 8.1** `CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N` |
 | Product | [MySQL Community Server](https://github.com/mysql/mysql-server) `mysqld` |
