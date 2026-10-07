@@ -17,6 +17,7 @@
 # mysql-set-role-leftover
 
 **Class:** Privilege leftover
+**Reach:** Remote
 
 **MySQL Community Server** `mysqld` `26.7.0` (`06a5c1c`) - Oracle
 
@@ -28,6 +29,7 @@
 |---|---|
 | ID | no CVE yet |
 | Class | **Privilege leftover** (FILE write as mysqld UID; not OS LPE) |
+| Reach | **Remote** (authenticated SQL) |
 | CWE | [CWE-269](https://cwe.mitre.org/data/definitions/269.html) |
 | CVSS | **High: 8.1** `CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N` |
 | Product | [MySQL Community Server](https://github.com/mysql/mysql-server) `mysqld` |
