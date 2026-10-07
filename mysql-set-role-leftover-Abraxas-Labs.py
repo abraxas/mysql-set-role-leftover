@@ -226,13 +226,17 @@ _builtins.print = _cprint
 
 """Loopback client for mysql-set-role-leftover. Runs lab/run.sh."""
 
-import os
 import subprocess
 import sys
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-LAB = HERE / "lab"
-os.chdir(LAB)
-raise SystemExit(subprocess.call([str(LAB / "run.sh"), *sys.argv[1:]]))
+
+def main() -> int:
+    lab = Path(__file__).resolve().parent / "lab"
+    proc = subprocess.run([str(lab / "run.sh"), *sys.argv[1:]], cwd=lab)
+    return int(proc.returncode)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 
