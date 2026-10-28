@@ -13,6 +13,10 @@
   &nbsp;·&nbsp;
   <a href="https://github.com/abraxas/mysql-set-role-leftover">mysql-set-role-leftover</a>
 </p>
+<p align="center">
+  Write-up: <a href="https://abraxaslabs.tech/research/mysql-set-role-leftover"><strong>https://abraxaslabs.tech/research/mysql-set-role-leftover</strong></a>
+</p>
+
 
 # mysql-set-role-leftover
 
